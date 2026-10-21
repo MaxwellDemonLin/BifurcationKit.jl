@@ -29,8 +29,23 @@ update_predictor!(state::AbstractContinuationState,
                   iter::AbstractContinuationIterable,
                   alg::AbstractContinuationAlgorithm) = getpredictor!(state, iter, alg)
 
-corrector!(state::AbstractContinuationState,
-            iter::AbstractContinuationIterable; kwargs...) = corrector!(state, iter, getalg(iter); kwargs...)
+function corrector!(state::AbstractContinuationState,
+                    iter::AbstractContinuationIterable; kwargs...)
+    try
+        return corrector!(state, iter, getalg(iter); kwargs...)
+    catch err
+        err isa FlowIntegrationFailure || rethrow()
+        # The trial solution has not been committed. Reject this correction
+        # immediately; native step-size control halves ds and retries.
+        state.converged = false
+        state.itnewton = 0
+        state.itlinear = 0
+        if iter.verbosity > 0
+            println("Rejecting correction: ", sprint(showerror, err))
+        end
+        return true
+    end
+end
 
 step_size_control!(state::AbstractContinuationState,
             iter::AbstractContinuationIterable) = step_size_control!(state, iter, getalg(iter))

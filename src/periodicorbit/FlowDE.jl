@@ -1,6 +1,21 @@
 using SciMLBase: remake, ODEProblem, EnsembleProblem, EnsembleThreads, DAEProblem, isinplace as isinplace_sciml
 import SciMLBase
 
+"""A failed time integration cannot define a shooting residual or derivative."""
+struct FlowIntegrationFailure{R,T} <: Exception
+    retcode::R
+    t::T
+end
+
+Base.showerror(io::IO, err::FlowIntegrationFailure) =
+    print(io, "Shooting integration failed with ", err.retcode, " at t=", err.t)
+
+function _check_flow_retcode(sol)
+    SciMLBase.successful_retcode(sol) ||
+        throw(FlowIntegrationFailure(sol.retcode, isempty(sol.t) ? sol.prob.tspan[1] : sol.t[end]))
+    return sol
+end
+
 @with_kw_noshow struct FlowDE{Tprob, Talg, Tjac, TprobMono, TalgMono, Tkwde, Tcb, Tvjp, TR01, TR11, TR20, TR30, Tδ} <: AbstractFlow
     "Store the ODEProblem associated to the flow of the Cauchy problem"
     odeprob::Tprob
@@ -91,7 +106,7 @@ end
 function _flow(x, pars, tm, pb::ODEProblem, alg; kwargs...)
     _prob = remake(pb; u0 = x, tspan = (zero(tm), tm), p = pars)
     # the use of concrete_solve makes it compatible with Zygote
-    sol = SciMLBase.solve(_prob, alg; save_everystep = false, kwargs...)
+    sol = _check_flow_retcode(SciMLBase.solve(_prob, alg; save_everystep = false, kwargs...))
     return (t = sol.t[end], u = sol.u[end])
 end
 #━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -126,7 +141,7 @@ function _dflow_jvp_serial(x::AbstractVector, pars, dx, tm, pb_monodromy_jvp::OD
     n = length(x)
     _prob = remake(pb_monodromy_jvp; u0 = vcat(x, dx), tspan = (zero(tm), tm), p = pars)
     # the use of concrete_solve makes it compatible with Zygote
-    sol = SciMLBase.solve(_prob, alg; save_everystep = false, k...).u[end]
+    sol = _check_flow_retcode(SciMLBase.solve(_prob, alg; save_everystep = false, k...)).u[end]
     return (t = tm, u = sol[1:n], du = sol[n+1:end])
 end
 
@@ -175,7 +190,7 @@ end
 # this function takes into account a parameter passed to the vector field and returns the full solution from the ODE solver. This is useful in Poincare Shooting to extract the period.
 function evolve(fl::FlowDE{T1}, ::Val{:Full}, x::AbstractArray, pars, tm; kw...) where {T1 <: ODEProblem}
     _prob = remake(fl.odeprob; u0 = x, tspan = (zero(tm), tm), p = pars)
-    return SciMLBase.solve(_prob, fl.alg; fl.kwargsDE..., kw...)
+    return _check_flow_retcode(SciMLBase.solve(_prob, fl.alg; fl.kwargsDE..., kw...))
 end
 
 function evolve(fl::FlowDE{T1}, ::Val{:Full}, x::AbstractMatrix, pars, tm; kw...) where {T1 <: EnsembleProblem}
