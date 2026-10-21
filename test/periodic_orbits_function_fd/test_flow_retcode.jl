@@ -15,6 +15,9 @@ using OrdinaryDiffEqRosenbrock: Rodas5P
     end
     flow = BK.Flow(ode, alg; abstol=1e-10, reltol=1e-10,
         unstable_check=unstable)
+    solution = SciMLBase.solve(ode, alg)
+    @test (@inferred BK._check_flow_retcode(solution)) === solution
+    @test (@inferred BK.evolve(flow, [0.2], [0.2], 1.0)).u[1] ≈ 0.2
     @test BK.evolve(flow, [0.2], [0.2], 1.0).u[1] ≈ 0.2
     @test_throws BK.FlowIntegrationFailure BK.evolve(flow, [0.4], [0.4], 1.0)
     @test_throws BK.FlowIntegrationFailure BK.evolve(flow, Val(:Full), [0.4], [0.4], 1.0)
@@ -96,6 +99,93 @@ using OrdinaryDiffEqRosenbrock: Rodas5P
     # Only integration-failure exceptions are converted to rejected steps.
     unrelated_bug[] = true
     @test_throws ErrorException BK.corrector!(state, it)
+end
+
+# Inject a failure only in the real FloquetQaD integrations, after the Newton
+# corrector has succeeded. This reproduces a perturbed trajectory failing
+# during the post-correction finite-difference Jacobian evaluation.
+struct RetcodeTestFloquet{E,R} <: BK.AbstractFloquetSolver
+    eigsolver::E
+    in_spectrum::R
+end
+
+function BK.compute_eigenvalues(fl::RetcodeTestFloquet, iter::BK.ContIterable,
+        state, u0, par, nev; kwargs...)
+    fl.in_spectrum[] = true
+    try
+        return BK.compute_eigenvalues(fl.eigsolver, iter, state, u0, par, nev; kwargs...)
+    finally
+        fl.in_spectrum[] = false
+    end
+end
+
+@testset "Failed Floquet integration rolls back the continuation step" begin
+    in_spectrum = Ref(false)
+    limit = Ref(0.35)
+    failed_solves = Ref(0)
+    f! = (du, u, p, t) -> (du[1] = p[1] - u[1])
+    ode = SciMLBase.ODEProblem(f!, [0.2], (0.0, 1.0), [0.2])
+    unstable = (dt, u, p, t) -> begin
+        bad = in_spectrum[] && p[1] > limit[]
+        bad && (failed_solves[] += 1)
+        bad
+    end
+    # A fixed period avoids introducing an autonomous phase multiplier.
+    section = (x, T, rest...) -> isempty(rest) ? T - 1.0 : rest[end]
+    sh = BK.Shooting(ode, Rodas5P(), 1, section;
+        lens=BK.@optic(_[1]), jacobian=BK.FiniteDifferences(),
+        update_section_every_step=0, abstol=1e-10, reltol=1e-10,
+        unstable_check=unstable)
+    eigsolver = RetcodeTestFloquet(BK.FloquetQaD(BK.DefaultEig()), in_spectrum)
+    opts = BK.ContinuationPar(ds=0.2, dsmin=0.025, dsmax=0.2,
+        p_min=0.0, p_max=1.0, detect_bifurcation=3, detect_fold=true,
+        nev=1, max_steps=12, newton_options=BK.NewtonPar(tol=1e-8))
+    branch = BK.continuation(sh, [0.2, 1.0], BK.PALC(), opts, BK.MatrixBLS();
+        eigsolver, record_from_solution=(z, ctx; kwargs...) -> (; value=z[1]))
+    @test length(branch.branch) > 1
+    @test all(pt -> pt.param <= limit[], branch.branch)
+    @test all(pt -> pt.stable, branch.branch)
+    @test failed_solves[] > 0
+
+    it = BK.ContIterable(BK.getprob(branch), BK.getalg(branch),
+        BK.getcontparams(branch); kind=branch.kind)
+    state, = iterate(it)
+    before = copy(state)
+    failed_solves[] = 0
+    iterate(it, state)
+    @test !state.converged
+    @test state.ds ≈ before.ds / 2
+    @test state.z.p == before.z.p
+    @test state.z.u == before.z.u
+    @test state.z_old.p == before.z_old.p
+    @test state.step == before.step
+    @test state.eigvals == before.eigvals
+    @test state.n_unstable == before.n_unstable
+    @test failed_solves[] == 1
+
+    iterate(it, state)
+    @test state.converged
+    @test 0.3 < state.z.p < limit[]
+    before = copy(state)
+    iterate(it, state)
+    @test !state.converged
+    @test state.z.p == before.z.p
+    @test state.z_old.p == before.z_old.p
+    @test state.τ.u == before.τ.u
+    @test state.τ.p == before.τ.p
+    @test state.step == before.step
+    @test state.eigvals == before.eigvals
+
+    # Even when the corrector converges, an invalid spectrum at dsmin must
+    # stop without committing that point or incrementing the branch step.
+    state.ds = opts.dsmin
+    limit[] = 0.1
+    BK.update_predictor!(state, it)
+    iterate(it, state)
+    @test !state.converged
+    @test state.stopcontinuation
+    @test state.z.p == before.z.p
+    @test state.step == before.step
 end
 
 struct FixedRetcodeTestPeriod end

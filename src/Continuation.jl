@@ -492,6 +492,11 @@ function Base.iterate(it::ContIterable,
         @printf(" = %2.4e ──▶  %2.4e [guess]\n", getp(state), clamp_predp(state.z_pred.p, it))
     end
 
+    # A converged corrector is not accepted until its spectrum is valid.
+    # Keep the previous point and tangent so a failed flow in the eigensolver
+    # can reject the entire trial and use the normal step-size retry.
+    previous_state = compute_eigenelements(it) ? copy(state) : nothing
+
     # for PALC, z_pred contains the previous solution
     corrector!(state, it; iterationC = step, z0 = state.z)
 
@@ -504,14 +509,25 @@ function Base.iterate(it::ContIterable,
 
         if compute_eigenelements(it)
             # computes eigen-elements, store them in state and update the stability indices in state
-            it_eigen = compute_eigenvalues!(it, state)
-            if verbose1
-                printstyled(color=:green,"──▶ Computed ", length(state.eigvals), " eigenvalues in ", it_eigen, " iterations, #unstable = ", state.n_unstable[1], "\n")
+            try
+                it_eigen = compute_eigenvalues!(it, state)
+                if verbose1
+                    printstyled(color=:green,"──▶ Computed ", length(state.eigvals), " eigenvalues in ", it_eigen, " iterations, #unstable = ", state.n_unstable[1], "\n")
+                end
+            catch err
+                err isa FlowIntegrationFailure || rethrow()
+                copyto!(state, previous_state)
+                state.converged = false
+                state.itnewton = 0
+                state.itlinear = 0
+                verbose && println("Rejecting spectrum trial: ", sprint(showerror, err))
             end
         end
-        # update the problem inplace
-        state.stopcontinuation = ~update_problem!(it, state)
-        state.step += 1
+        if converged(state)
+            # update the problem inplace only after the spectrum succeeded
+            state.stopcontinuation = ~update_problem!(it, state)
+            state.step += 1
+        end
     else
         verbose && printstyled("Newton correction failed\n", color = :red)
     end
